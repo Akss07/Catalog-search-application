@@ -6,6 +6,8 @@ public class ApiError {
     private String message;
     private HttpStatus statusCode;
 
+    public ApiError(){}
+
     public ApiError(String message, HttpStatus statusCode){
         this.message = message;
         this.statusCode = statusCode;
