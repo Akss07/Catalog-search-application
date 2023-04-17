@@ -1,5 +1,6 @@
 package com.info7255.advancebigdata.controller;
 
+import com.info7255.advancebigdata.AdvanceBigDataApplication;
 import com.info7255.advancebigdata.dao.ErrorResponse;
 import com.info7255.advancebigdata.dao.JwtResponse;
 import com.info7255.advancebigdata.exception.*;
@@ -7,10 +8,14 @@ import com.info7255.advancebigdata.service.ETagService;
 import com.info7255.advancebigdata.service.MedicalPlanService;
 import com.info7255.advancebigdata.util.JsonValidator;
 import com.info7255.advancebigdata.util.JwtUtil;
+import org.everit.json.schema.Schema;
 import org.everit.json.schema.ValidationException;
+import org.everit.json.schema.loader.SchemaLoader;
 import org.json.JSONObject;
+import org.json.JSONTokener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -23,7 +28,7 @@ import java.util.*;
 
 
 @RestController
-@RequestMapping("v1/plan")
+@RequestMapping("plan")
 public class MedicalPlanController {
     private final static Logger logger = LoggerFactory.getLogger(MedicalPlanController.class);
     @Autowired
@@ -36,9 +41,12 @@ public class MedicalPlanController {
     ETagService eTagService;
     private final JwtUtil jwtUtil;
 
-    public MedicalPlanController(MedicalPlanService medicalPlanService, JwtUtil jwtUtil) {
+    private final RabbitTemplate template;
+
+    public MedicalPlanController(MedicalPlanService medicalPlanService, JwtUtil jwtUtil, RabbitTemplate template) {
         this.medicalPlanService = medicalPlanService;
         this.jwtUtil = jwtUtil;
+        this.template = template;
     }
 
     @GetMapping("/token")
@@ -67,9 +75,11 @@ public class MedicalPlanController {
             throw new BadRequestException("Request Body can not be empty");
         }
         JSONObject jsonObject = new JSONObject(planJson);
+        JSONObject schemaJSON = new JSONObject(new JSONTokener(Objects.requireNonNull(MedicalPlanController.class.getResourceAsStream("/plan-schema.json"))));
+        Schema schema = SchemaLoader.load(schemaJSON);
         try{
-            jsonValidator.validateJson(jsonObject);
-        }catch (ValidationException | IOException ex){
+            schema.validate(jsonObject);
+        }catch (ValidationException ex){
             throw new BadRequestException(ex.getMessage());
         }
         String key = jsonObject.get("objectType").toString() + "_" + jsonObject.getString("objectId").toString();
@@ -79,6 +89,15 @@ public class MedicalPlanController {
             throw new ConflictException("Plan already exists!", HttpStatus.CONFLICT.toString());
         }
         String newEtag = medicalPlanService.createPlan(key, jsonObject);
+
+        // Send a message to queue for indexing
+        Map<String, String> message = new HashMap<>();
+        message.put("operation", "SAVE");
+        message.put("body", planJson);
+
+        System.out.println("Sending message: " + message);
+        template.convertAndSend(AdvanceBigDataApplication.queueName, message);
+
         HttpHeaders httpHeaders = new HttpHeaders();
         httpHeaders.setETag(newEtag);
         return new ResponseEntity<>("{\"objectId\": \"" + jsonObject.getString("objectId")+ "\"}", httpHeaders, HttpStatus.CREATED);
@@ -127,7 +146,16 @@ public class MedicalPlanController {
         }
 
         if (ifMatch.size() == 0) throw new ETagParseException("ETag is not provided with request!");
-        if (!ifMatch.contains(eTag)) return preConditionFailed(eTag);
+        //if (!ifMatch.contains(eTag)) return preConditionFailed(eTag);
+
+        // Send message to queue for deleting indices
+        Map<String, Object> plan = medicalPlanService.getPlan(key);
+        Map<String, String> message = new HashMap<>();
+        message.put("operation", "DELETE");
+        message.put("body",  new JSONObject(plan).toString());
+
+        System.out.println("Sending message: " + message);
+        template.convertAndSend(AdvanceBigDataApplication.queueName, message);
 
         medicalPlanService.deletePlan(key);
         return new ResponseEntity<>(HttpStatus.NO_CONTENT);
@@ -162,13 +190,21 @@ public class MedicalPlanController {
 //        String oldPlan = medicalPlanService.getPlan(key).toString();
 //        String newPlan = jsonObject.toString();
 
-        try {
-            jsonValidator.validateJson(jsonObject);
-        } catch (ValidationException | IOException ex) {
-            throw new BadRequestException(ex.getMessage());
-        }
+//        try {
+//            jsonValidator.validateJson(jsonObject);
+//        } catch (ValidationException | IOException ex) {
+//            throw new BadRequestException(ex.getMessage());
+//        }
 
         String updatedEtag = medicalPlanService.createPlan(key, jsonObject);
+
+        // Send message to queue for index update
+        Map<String, String> message = new HashMap<>();
+        message.put("operation", "SAVE");
+        message.put("body", planJson);
+
+        System.out.println("Sending message: " + message);
+        template.convertAndSend(AdvanceBigDataApplication.queueName, message);
 
         HttpHeaders httpHeaders = new HttpHeaders();
         httpHeaders.setETag(updatedEtag);
@@ -199,16 +235,37 @@ public class MedicalPlanController {
         if (!ifMatch.contains(eTag)) return preConditionFailed(eTag);
 
         JSONObject jsonObject = new JSONObject(planJson);
+        JSONObject schemaJSON = new JSONObject(new JSONTokener(Objects.requireNonNull(MedicalPlanController.class.getResourceAsStream("/plan-schema.json"))));
+        Schema schema = SchemaLoader.load(schemaJSON);
         try {
-            jsonValidator.validateJson(jsonObject);
-        } catch (ValidationException | IOException ex) {
+            schema.validate(jsonObject);
+        } catch (ValidationException ex) {
             throw new BadRequestException(ex.getMessage());
         }
+        // Send message to queue for deleting previous indices incase of put
+        Map<String, Object> oldPlan = medicalPlanService.getPlan(key);
+        Map<String, String> message = new HashMap<>();
+        message.put("operation", "DELETE");
+        message.put("body", new JSONObject(oldPlan).toString());
+
+        System.out.println("Sending message: " + message);
+        template.convertAndSend(AdvanceBigDataApplication.queueName, message);
 
         medicalPlanService.deletePlan(key);
         String updatedEtag = medicalPlanService.createPlan(key, jsonObject);
+
+        // Send message to queue for index update
+        Map<String, Object> newPlan = medicalPlanService.getPlan(key);
+        message = new HashMap<>();
+        message.put("operation", "SAVE");
+        message.put("body", new JSONObject(newPlan).toString());
+
+        System.out.println("Sending message: " + message);
+        template.convertAndSend(AdvanceBigDataApplication.queueName, message);
+
         HttpHeaders httpHeaders = new HttpHeaders();
         httpHeaders.setETag(updatedEtag);
+
         return ResponseEntity.ok()
                 .eTag(updatedEtag)
                 .body(new JSONObject().put("message: ", "Plan updated successfully!!").toString());
